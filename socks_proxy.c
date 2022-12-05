@@ -82,7 +82,14 @@ static int init_and_bind_proxy_socket(args_t args) {
     }
     int return_value = set_reusable(proxy_socket);
     if (return_value == FAIL) {
+        close(proxy_socket);
         fprintf(stderr, "[PROXY] Failed to make socket reusable\n");
+        return FAIL;
+    }
+    return_value = set_nonblocking(proxy_socket);
+    if (return_value == FAIL) {
+        close(proxy_socket);
+        fprintf(stderr, "[PROXY] Failed to make socket nonblocking\n");
         return FAIL;
     }
     struct sockaddr_in proxy_sockaddr;
