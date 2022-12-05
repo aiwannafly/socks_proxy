@@ -299,4 +299,3 @@ server_response_t *parse_response_message(const message_t *message, bool allow_p
     free(packet);
     return res;
 }
-

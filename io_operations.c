@@ -8,7 +8,6 @@
 
 #define FAIL (-1)
 #define DEFAULT_BUFFER_SIZE (128)
-#define MSG_LENGTH_LIMIT (4 * 1024)
 
 bool write_into_file(int fd, message_t *message) {
     if (NULL == message) {
@@ -79,6 +78,7 @@ message_t *read_from_socket(int socket_fd) {
             }
         }
         if (0 == read_bytes || offset >= MSG_LENGTH_LIMIT) {
+            offset += read_bytes;
             break;
         } else {
             offset += read_bytes;

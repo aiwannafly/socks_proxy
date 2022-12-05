@@ -2,31 +2,102 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <mqueue.h>
+#include <unistd.h>
 
-#include "socks_messages.h"
+#include "io_operations.h"
+
+#define FAIL (-1)
+#define SUCCESS (0)
+
+//message_t *read_from_socket(int socket_fd) {
+//    size_t capacity = DEFAULT_BUFFER_SIZE;
+//    char *buffer = malloc(capacity + 1);
+//    if (buffer == NULL) {
+//        return NULL;
+//    }
+//    size_t offset = 0;
+//    size_t portion = DEFAULT_BUFFER_SIZE;
+//    message_t *message = (message_t *) malloc(sizeof(*message));
+//    if (NULL == message) {
+//        free(buffer);
+//        return NULL;
+//    }
+//    while (true) {
+//        if (offset + portion > capacity) {
+//            capacity *= 2;
+//            char *temp = realloc(buffer, capacity);
+//            if (NULL == temp) {
+//                free(buffer);
+//                return NULL;
+//            }
+//            buffer = temp;
+//        }
+//        long read_bytes = read(socket_fd, buffer + offset, portion);
+//        if (FAIL == read_bytes) {
+//            if (errno == EINTR) {
+//                continue;
+//            } else if (errno == EAGAIN) {
+//                fprintf(stderr, "EAGAIN\n");
+//                buffer[offset] = '\0';
+//                message->data = buffer;
+//                message->len = offset;
+//                return message;
+//            } else {
+//                free(buffer);
+//                free(message);
+//                return NULL;
+//            }
+//        }
+//        offset += read_bytes;
+//        if (0 == read_bytes || offset >= MSG_LENGTH_LIMIT) {
+//            break;
+//        }
+//    }
+//    buffer[offset] = '\0';
+//    message->data = buffer;
+//    message->len = offset;
+//    return message;
+//}
 
 int main() {
-    conn_request_info_t info = {
-            .dest_port = 5010,
-            .dest_address = "127.0.0.1",
-            .address_type = IPV4_TYPE,
-            .command_code = 1
-    };
-    message_t *message = write_conn_request_message(&info);
-    if (message == NULL) {
-        fprintf(stderr, "could not parse request info\n");
-        return -1;
+    int rfd = open("big_text.txt", R_OK);
+    int wfd = open("big_text2", W_OK);
+    if (rfd == FAIL) {
+        perror("error in open()");
+        return FAIL;
     }
-    printf("len: %zu\n", message->len);
-    conn_request_info_t *decoded = parse_conn_request_message(message, true);
-    if (decoded == NULL) {
-        fprintf(stderr, "could not decode request info\n");
-        free(message);
-        return -1;
+    if (wfd == FAIL) {
+        perror("error in open()");
+        close(rfd);
+        return FAIL;
     }
-    printf("port = %d, addr = %s, type = %d, cmd_code = %d\n",
-           decoded->dest_port, decoded->dest_address, decoded->address_type, decoded->command_code);
-    free(message);
-    free(decoded);
-    return 0;
+    size_t total_len = 0;
+    while (true) {
+        message_t *part = read_from_socket(rfd);
+        if (part == NULL) {
+            perror("error in read_from_socket()");
+            close(rfd);
+            close(wfd);
+            return FAIL;
+        }
+        total_len += part->len;
+        printf("part len: %zu\n", part->len);
+        if (part->len == 0) {
+            free(part->data);
+            free(part);
+            break;
+        }
+        bool written = write_into_file(wfd, part);
+        free(part->data);
+        free(part);
+        if (!written) {
+            perror("error in write_into_file()");
+            break;
+        }
+    }
+    printf("total len: %zu\n", total_len);
+    close(rfd);
+    close(wfd);
+    return SUCCESS;
 }

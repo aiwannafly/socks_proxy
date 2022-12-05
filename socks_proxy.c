@@ -283,7 +283,9 @@ static int handle_new_message(int fd, int *translation_table, fd_set *read_set, 
             return TERMINATE;
         }
     }
+    fprintf(stderr, "1\n");
     message_t *message = read_from_socket(fd);
+    fprintf(stderr, "2\n");
     if (NULL == message) {
         perror("[PROXY] Error in read");
         return FAIL;
@@ -296,6 +298,7 @@ static int handle_new_message(int fd, int *translation_table, fd_set *read_set, 
     }
     // here we got a message from a client
     // we should check whether he established connection or not
+    fprintf(stderr, "3\n");
     if (status_table[fd] == NEW_CLIENT) {
         int return_value = handle_greeting(fd, message);
         free(message->data);
@@ -321,8 +324,10 @@ static int handle_new_message(int fd, int *translation_table, fd_set *read_set, 
         }
         return return_value;
     }
+    fprintf(stderr, "4\n");
     if (print_allowed) printf("[PROXY] Received from %d:\n%s\n\nLength: %zu\n", fd, message->data, message->len);
     bool sent = write_into_file(translation_table[fd], message);
+    fprintf(stderr, "5\n");
     if (!sent) {
         perror("[PROXY] Error in write");
     }
@@ -407,6 +412,7 @@ int main(int argc, char *argv[]) {
                         break;
                     }
                 } else {
+                    fprintf(stderr, "[PROXY] handle new message...\n");
                     return_value = handle_new_message(fd, translation_table, &master_read_set, &max_sd);
                     if (return_value == TERMINATE) {
                         goto FINISH;
