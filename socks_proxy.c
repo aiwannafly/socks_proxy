@@ -25,6 +25,7 @@
 #define READ_PIPE_END (0)
 #define WRITE_PIPE_END (1)
 #define TERMINATE_COMMAND "stop"
+#define CONNECT_TIMEOUT (5)
 
 #define NEW_CLIENT (0)
 #define PASSED_GREETING (1)
@@ -216,7 +217,11 @@ static int handle_conn_request(int fd, int *translation_table, fd_set *read_set,
         return FAIL;
     }
     if (print_allowed) printf("[PROXY] Got request to connect to %s %d\n", info->dest_address, info->dest_port);
-    int server_fd = connect_to_address(info->dest_address, info->dest_port);
+    struct timeval timeout = {
+            .tv_sec = CONNECT_TIMEOUT,
+            .tv_usec = 0
+    };
+    int server_fd = connect_to_address(info->dest_address, info->dest_port, &timeout);
     char status_code = 0; // success
     if (server_fd == FAIL) {
         if (errno == ENETUNREACH) {
@@ -249,9 +254,7 @@ static int handle_conn_request(int fd, int *translation_table, fd_set *read_set,
         }
         return FAIL;
     }
-    fprintf(stderr, "4\n");
     bool written = write_into_file(fd, response_msg);
-    fprintf(stderr, "5\n");
     free(response_msg->data);
     free(response_msg);
     if (!written) {
@@ -318,7 +321,7 @@ static int handle_new_message(int fd, int *translation_table, fd_set *read_set, 
         }
         return return_value;
     }
-    if (print_allowed) printf("[PROXY] Received from %d: %s    Length: %zu\n", fd, message->data, message->len);
+    if (print_allowed) printf("[PROXY] Received from %d:\n%s\n\nLength: %zu\n", fd, message->data, message->len);
     bool sent = write_into_file(translation_table[fd], message);
     if (!sent) {
         perror("[PROXY] Error in write");

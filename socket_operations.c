@@ -1,6 +1,8 @@
 #include "socket_operations.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -43,27 +45,66 @@ int set_reusable(int serv_socket) {
 /*
  * returns non-blocking socket descriptor
  */
-int connect_to_address(char *serv_ipv4_address, int port) {
+int connect_to_address(char *serv_ipv4_address, int port,
+                       struct timeval *timeout) {
     if (port < 0 || port >= 65536) {
         return FAIL;
     }
-    int client_sd = socket(AF_INET, SOCK_STREAM, 0);
-    if (client_sd == FAIL) {
+    int sockno = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockno == FAIL) {
         return FAIL;
     }
     struct sockaddr_in serv_sockaddr;
     serv_sockaddr.sin_family = AF_INET;
     serv_sockaddr.sin_port = htons(port);
     if (inet_pton(AF_INET, serv_ipv4_address, &serv_sockaddr.sin_addr) == FAIL) {
+        close(sockno);
         return FAIL;
     }
-    fprintf(stderr, "before connect\n");
-    int return_value = connect(client_sd, (struct sockaddr *) &serv_sockaddr, sizeof(serv_sockaddr));
-    fprintf(stderr, "after connect\n");
-    if (return_value == FAIL) {
+    int opt = fcntl(sockno, F_GETFL, NULL);
+    if (opt < 0) {
+        close(sockno);
         return FAIL;
     }
-    return client_sd;
+    int return_code = fcntl(sockno, F_SETFL, opt | O_NONBLOCK);
+    if (return_code < 0) {
+        close(sockno);
+        return FAIL;
+    }
+    return_code = connect(sockno, (const struct sockaddr *) &serv_sockaddr, sizeof(serv_sockaddr));
+    if (return_code < 0) {
+        if (errno == EINPROGRESS) {
+            fd_set wait_set;
+            // make file descriptor set with socket
+            FD_ZERO(&wait_set);
+            FD_SET(sockno, &wait_set);
+            // wait for socket to be writable; return after given timeout
+            return_code = select(sockno + 1, NULL, &wait_set, NULL, timeout);
+        }
+    } else {
+        return_code = 1;
+    }
+    if (return_code < 0) {
+        close(sockno);
+        return FAIL;
+    } else if (return_code == 0) {
+        errno = ETIMEDOUT;
+        close(sockno);
+        return FAIL;
+    } else {
+        socklen_t len = sizeof(opt);
+        return_code = getsockopt(sockno, SOL_SOCKET, SO_ERROR, &opt, &len);
+        if (return_code < 0) {
+            close(sockno);
+            return FAIL;
+        }
+        if (opt != SUCCESS) {
+            errno = opt;
+            close(sockno);
+            return FAIL;
+        }
+    }
+    return sockno;
 }
 
 int make_new_connection_sockaddr(struct sockaddr_in *addr, int port) {
