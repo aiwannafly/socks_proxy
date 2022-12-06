@@ -16,6 +16,7 @@
 #define GENERAL_ERROR (1)
 #define MAX_AUTHS_COUNT (16)
 #define NO_METHODS_ACCEPTED (0xFF)
+#define WITHOUT_AUTH (0x00)
 
 typedef struct conn_request_info_t {
     char dest_address[ADDR_BUFFER_SIZE];

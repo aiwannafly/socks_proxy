@@ -32,7 +32,7 @@ static void handle_sigint_sigterm(int sig) {
             .data = TERMINATE_COMMAND,
             .len = strlen(TERMINATE_COMMAND)
     };
-    write_into_file(signal_pipe[WRITE_PIPE_END], &terminate);
+    write_all(signal_pipe[WRITE_PIPE_END], &terminate);
 }
 
 int main() {
@@ -126,7 +126,7 @@ int main() {
                         }
                     }
                     printf("[SERVER] Reading from %d...\n", fd);
-                    message_t *message = read_from_socket(fd);
+                    message_t *message = read_all(fd);
                     if (NULL == message) {
                         perror("[SERVER] Error in read");
                         continue;
@@ -154,7 +154,7 @@ int main() {
                             .data = message->data,
                             .len = message->len
                     };
-                    bool sent_reply = write_into_file(fd, &reply);
+                    bool sent_reply = write_all(fd, &reply);
                     if (!sent_reply) {
                         perror("[SERVER] Error in write");
                     } else {

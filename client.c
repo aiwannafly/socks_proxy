@@ -72,14 +72,14 @@ int main(int argc, char *argv[]) {
         perror("[CLIENT] Error in create_default_client_greeting_message");
         goto FINISH;
     }
-    bool written = write_into_file(socket_fd, greeting_message);
+    bool written = write_all(socket_fd, greeting_message);
     free(greeting_message->data);
     free(greeting_message);
     if (!written) {
         perror("[CLIENT] Error in write_into_file");
         goto FINISH;
     }
-    message_t *server_choice = read_from_socket(socket_fd);
+    message_t *server_choice = read_all(socket_fd);
     if (NULL == server_choice) {
         perror("[CLIENT] Error in read");
         goto FINISH;
@@ -104,14 +104,14 @@ int main(int argc, char *argv[]) {
     }
     printf("[CLIENT] Trying to connect to %s %d using proxy with port %d\n", ip_address, request.dest_port,
            args.proxy_server_port);
-    written = write_into_file(socket_fd, request_message);
+    written = write_all(socket_fd, request_message);
     free(request_message->data);
     free(request_message);
     if (!written) {
         perror("[CLIENT] Error in write_into_file");
         goto FINISH;
     }
-    message_t *reply_from_server = read_from_socket(socket_fd);
+    message_t *reply_from_server = read_all(socket_fd);
     if (NULL == reply_from_server) {
         perror("[CLIENT] Error in read");
         goto FINISH;
@@ -141,7 +141,7 @@ int main(int argc, char *argv[]) {
                 .data = buffer,
                 .len = strlen(buffer)
         };
-        written = write_into_file(socket_fd, &message);
+        written = write_all(socket_fd, &message);
         if (!written) {
             perror("[CLIENT] Error in write");
             break;
@@ -149,7 +149,7 @@ int main(int argc, char *argv[]) {
         if (strcmp(STOP_MESSAGE, input) == 0) {
             break;
         }
-        reply_from_server = read_from_socket(socket_fd);
+        reply_from_server = read_all(socket_fd);
         if (NULL == reply_from_server) {
             perror("[CLIENT] Error in read");
             continue;

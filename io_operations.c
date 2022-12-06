@@ -9,7 +9,7 @@
 #define FAIL (-1)
 #define DEFAULT_BUFFER_SIZE (128)
 
-bool write_into_file(int fd, message_t *message) {
+bool write_all(int fd, message_t *message) {
     if (NULL == message) {
         return false;
     }
@@ -50,7 +50,7 @@ bool fwrite_into_pipe(FILE *pipe_fd, char *buffer, size_t len) {
     }
 }
 
-message_t *read_from_socket(int socket_fd) {
+message_t *read_all(int socket_fd) {
     size_t capacity = DEFAULT_BUFFER_SIZE;
     char *buffer = malloc(capacity + 1);
     if (buffer == NULL) {
@@ -72,6 +72,16 @@ message_t *read_from_socket(int socket_fd) {
         if (FAIL == read_bytes) {
             if (errno == EINTR) {
                 continue;
+            } else if (errno == EAGAIN) {
+                buffer[offset] = '\0';
+                message_t *message = (message_t *) malloc(sizeof(*message));
+                if (NULL == message) {
+                    free(buffer);
+                    return NULL;
+                }
+                message->data = buffer;
+                message->len = offset;
+                return message;
             } else {
                 free(buffer);
                 return NULL;

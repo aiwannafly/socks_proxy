@@ -8,6 +8,8 @@
 #include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <assert.h>
+#include <fcntl.h>
 
 #include "io_operations.h"
 #include "socket_operations.h"
@@ -25,23 +27,40 @@
 #define READ_PIPE_END (0)
 #define WRITE_PIPE_END (1)
 #define TERMINATE_COMMAND "stop"
-#define CONNECT_TIMEOUT (5)
 
 #define NEW_CLIENT (0)
 #define PASSED_GREETING (1)
 #define PASSED_SEND_REQUEST (2)
 #define REJECTED (3)
 #define SERVER (4)
+#define WAIT_FOR_CONNECT (5)
 
 int signal_pipe[2];
-bool print_allowed = false;
-int status_table[MAX_CLIENTS_COUNT * 2 + 3];
+
+static int max(int a, int b);
 
 typedef struct args_t {
     bool valid;
     int proxy_server_port;
     bool print_allowed;
 } args_t;
+
+typedef struct proxy_t {
+    int max_fd;
+    fd_set read_wait_set;
+    fd_set write_wait_set;
+    /* This table matches client socket of a proxy server
+    * and client socket of a main server */
+    int translation_table[MAX_CLIENTS_COUNT * 2 + 3];
+    int status_table[MAX_CLIENTS_COUNT * 2 + 3];
+    /*
+     * When we need to send a message to socket, we
+     * must add it to selector and put message here
+     */
+    message_t *message_queue[MAX_CLIENTS_COUNT * 2 + 3];
+    bool has_message_to_send[MAX_CLIENTS_COUNT * 2 + 3];
+    bool print_allowed;
+} proxy_t;
 
 static bool extract_int(const char *buf, int *num) {
     if (NULL == buf || num == NULL) {
@@ -114,7 +133,7 @@ static void handle_sigint_sigterm(__attribute__((unused)) int sig) {
             .data = TERMINATE_COMMAND,
             .len = strlen(TERMINATE_COMMAND)
     };
-    write_into_file(signal_pipe[WRITE_PIPE_END], &terminate);
+    write_all(signal_pipe[WRITE_PIPE_END], &terminate);
 }
 
 static int init_signal_handlers() {
@@ -128,7 +147,7 @@ static int init_signal_handlers() {
     return SUCCESS;
 }
 
-static int handle_new_connection(int proxy_socket, fd_set *read_set, int *max_sd) {
+static int handle_new_connection(int proxy_socket, proxy_t *proxy) {
     int new_client_fd = accept(proxy_socket, NULL, NULL);
     if (new_client_fd == FAIL) {
         if (errno != EAGAIN) {
@@ -141,40 +160,53 @@ static int handle_new_connection(int proxy_socket, fd_set *read_set, int *max_sd
         close(new_client_fd);
         return FAIL;
     }
-    FD_SET(new_client_fd, read_set);
-    if (new_client_fd > *max_sd) {
-        *max_sd = new_client_fd;
+    FD_SET(new_client_fd, &proxy->read_wait_set);
+    if (new_client_fd > proxy->max_fd) {
+        proxy->max_fd = new_client_fd;
     }
+    proxy->has_message_to_send[new_client_fd] = false;
     return SUCCESS;
 }
 
-static void close_connection(int fd, int *translation_table, fd_set *read_set, int *max_sd) {
+static void close_connection(int fd, proxy_t *proxy) {
     // connection was closed
     int return_value = close(fd);
     if (return_value == FAIL) {
         perror("[PROXY] Error in close");
     }
-    if (print_allowed) printf("[PROXY] Closed connection %d\n", fd);
-    FD_CLR(fd, read_set);
-    if (fd == *max_sd) {
-        *max_sd -= 1;
+    if (proxy->print_allowed) printf("[PROXY] Closed connection %d\n", fd);
+    FD_CLR(fd, &proxy->read_wait_set);
+    if (fd == proxy->max_fd) {
+        proxy->max_fd--;
     }
-    if (translation_table[fd] != 0) {
-        return_value = close(translation_table[fd]);
+    if (proxy->translation_table[fd] != 0) {
+        return_value = close(proxy->translation_table[fd]);
         if (return_value == FAIL) {
             perror("[PROXY] Error in close");
         }
-        if (print_allowed) printf("[PROXY] Closed connection %d\n", translation_table[fd]);
-        FD_CLR(translation_table[fd], read_set);
-        if (translation_table[fd] == *max_sd) {
-            *max_sd -= 1;
+        if (proxy->print_allowed) printf("[PROXY] Closed connection %d\n", proxy->translation_table[fd]);
+        FD_CLR(proxy->translation_table[fd], &proxy->read_wait_set);
+        if (proxy->translation_table[fd] == proxy->max_fd) {
+            proxy->max_fd--;
         }
-        translation_table[translation_table[fd]] = 0;
-        translation_table[fd] = 0;
+        proxy->translation_table[proxy->translation_table[fd]] = 0;
+        proxy->translation_table[fd] = 0;
     }
 }
 
-static int handle_greeting(int fd, message_t *greeting_msg) {
+static void put_message_into_queue(int fd, proxy_t *proxy, message_t *message) {
+    if (proxy->has_message_to_send[fd] && proxy->message_queue[fd] != NULL) {
+        free(proxy->message_queue[fd]->data);
+        free(proxy->message_queue[fd]);
+    }
+    proxy->message_queue[fd] = message;
+    FD_SET(fd, &proxy->write_wait_set);
+    proxy->max_fd = max(proxy->max_fd, fd);
+    proxy->has_message_to_send[fd] = true;
+}
+
+static int handle_greeting(int fd, proxy_t *proxy, message_t *greeting_msg) {
+    assert(greeting_msg);
     client_greeting_t *greeting = parse_client_greeting(greeting_msg, true);
     if (greeting == NULL) {
         fprintf(stderr, "[PROXY] could not parse greeting message\n");
@@ -188,7 +220,7 @@ static int handle_greeting(int fd, message_t *greeting_msg) {
         }
     }
     free(greeting);
-    char choice = 0x00;
+    char choice = WITHOUT_AUTH;
     if (!acceptable) {
         choice = NO_METHODS_ACCEPTED;
     }
@@ -197,31 +229,86 @@ static int handle_greeting(int fd, message_t *greeting_msg) {
         fprintf(stderr, "[PROXY] could not create choice message\n");
         return FAIL;
     }
-    bool written = write_into_file(fd, choice_message);
-    free(choice_message->data);
-    free(choice_message);
-    if (!written) {
-        fprintf(stderr, "[PROXY] error in write_into_file\n");
-        return FAIL;
-    }
+    put_message_into_queue(fd, proxy, choice_message);
+    if (proxy->print_allowed) printf("[PROXY] Pushed greeting into queue, fd = %d\n", fd);
     if (acceptable) {
         return SUCCESS;
     }
     return FAIL;
 }
 
-static int handle_conn_request(int fd, int *translation_table, fd_set *read_set, int *max_sd, message_t *message) {
+static int connect_to_remote(int sd, proxy_t *proxy) {
+    FD_CLR(sd, &proxy->write_wait_set);
+    proxy->status_table[sd] = NEW_CLIENT;
+    int opt = fcntl(sd, F_GETFL, NULL);
+    if (opt < 0) {
+        close(sd);
+        return FAIL;
+    }
+    socklen_t len = sizeof(opt);
+    int return_code = getsockopt(sd, SOL_SOCKET, SO_ERROR, &opt, &len);
+    if (return_code < 0) {
+        close(sd);
+        return FAIL;
+    }
+    if (opt != SUCCESS) {
+        errno = opt;
+        close(sd);
+        return FAIL;
+    }
+    proxy->status_table[sd] = SERVER;
+    return SUCCESS;
+}
+
+static int start_connecting(char *serv_ipv4_address, int port, proxy_t *proxy) {
+    if (port < 0 || port >= 65536) {
+        return FAIL;
+    }
+    int sd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sd == FAIL) {
+        return FAIL;
+    }
+    struct sockaddr_in serv_sockaddr;
+    serv_sockaddr.sin_family = AF_INET;
+    serv_sockaddr.sin_port = htons(port);
+    if (inet_pton(AF_INET, serv_ipv4_address, &serv_sockaddr.sin_addr) == FAIL) {
+        close(sd);
+        return FAIL;
+    }
+    int opt = fcntl(sd, F_GETFL, NULL);
+    if (opt < 0) {
+        close(sd);
+        return FAIL;
+    }
+    int return_code = fcntl(sd, F_SETFL, opt | O_NONBLOCK);
+    if (return_code < 0) {
+        close(sd);
+        return FAIL;
+    }
+    return_code = connect(sd, (const struct sockaddr *) &serv_sockaddr, sizeof(serv_sockaddr));
+    if (return_code < 0) {
+        if (errno == EINPROGRESS) {
+            FD_SET(sd, &proxy->write_wait_set);
+            proxy->status_table[sd] = WAIT_FOR_CONNECT;
+            proxy->max_fd = max(proxy->max_fd, sd);
+            return sd;
+        }
+        return FAIL;
+    }
+    proxy->status_table[sd] = SERVER;
+    return sd;
+}
+
+static int handle_conn_request(int fd, proxy_t *proxy, message_t *message) {
+    assert(proxy);
+    assert(message);
     conn_request_info_t *info = parse_conn_request_message(message, true);
     if (info == NULL) {
         fprintf(stderr, "[PROXY] could not parse request message\n");
         return FAIL;
     }
-    if (print_allowed) printf("[PROXY] Got request to connect to %s %d\n", info->dest_address, info->dest_port);
-    struct timeval timeout = {
-            .tv_sec = CONNECT_TIMEOUT,
-            .tv_usec = 0
-    };
-    int server_fd = connect_to_address(info->dest_address, info->dest_port, &timeout);
+    if (proxy->print_allowed) printf("[PROXY] Got request to connect to %s %d\n", info->dest_address, info->dest_port);
+    int server_fd = start_connecting(info->dest_address, info->dest_port, proxy);
     char status_code = 0; // success
     if (server_fd == FAIL) {
         if (errno == ENETUNREACH) {
@@ -233,12 +320,6 @@ static int handle_conn_request(int fd, int *translation_table, fd_set *read_set,
         }
         fprintf(stderr, "[PROXY] failed to establish connection, code: %d\n", status_code);
     }
-    int return_value = set_nonblocking(server_fd);
-    if (return_value == FAIL) {
-        close(server_fd);
-        return FAIL;
-    }
-    if (print_allowed) printf("[PROXY] Connected\n");
     server_response_t response = {
             .status_code = status_code,
             .bind_port = info->dest_port,
@@ -252,22 +333,26 @@ static int handle_conn_request(int fd, int *translation_table, fd_set *read_set,
         if (server_fd != FAIL) {
             close(server_fd);
         }
+        close_connection(fd, proxy);
         return FAIL;
     }
-    bool written = write_into_file(fd, response_msg);
-    free(response_msg->data);
-    free(response_msg);
-    if (!written) {
-        fprintf(stderr, "[PROXY] error in write_into_file()\n");
-    }
+    put_message_into_queue(fd, proxy, response_msg);
     if (server_fd != FAIL) {
-        translation_table[fd] = server_fd;
-        translation_table[server_fd] = fd;
-        FD_SET(server_fd, read_set);
-        if (server_fd > *max_sd) {
-            *max_sd = server_fd;
+        int return_value = set_nonblocking(server_fd);
+        if (return_value == FAIL) {
+            close_connection(fd, proxy);
+            close(server_fd);
+            return FAIL;
         }
-        status_table[server_fd] = SERVER;
+        if (proxy->print_allowed) printf("[PROXY] Connected\n");
+        proxy->translation_table[fd] = server_fd;
+        proxy->translation_table[server_fd] = fd;
+        FD_SET(server_fd, &proxy->read_wait_set);
+        if (server_fd > proxy->max_fd) {
+            proxy->max_fd = server_fd;
+        }
+    } else {
+        close_connection(fd, proxy);
     }
     return SUCCESS;
 }
@@ -275,7 +360,7 @@ static int handle_conn_request(int fd, int *translation_table, fd_set *read_set,
 /*
  * returns FAIL, SUCCESS OR TERMINATE codes
  */
-static int handle_new_message(int fd, int *translation_table, fd_set *read_set, int *max_sd) {
+static int handle_new_message(int fd, proxy_t *proxy) {
     if (fd == signal_pipe[READ_PIPE_END]) {
         char *message = read_from_file(fd);
         if (strcmp(message, TERMINATE_COMMAND) == 0) {
@@ -283,9 +368,7 @@ static int handle_new_message(int fd, int *translation_table, fd_set *read_set, 
             return TERMINATE;
         }
     }
-    fprintf(stderr, "1\n");
-    message_t *message = read_from_socket(fd);
-    fprintf(stderr, "2\n");
+    message_t *message = read_all(fd);
     if (NULL == message) {
         perror("[PROXY] Error in read");
         return FAIL;
@@ -293,75 +376,93 @@ static int handle_new_message(int fd, int *translation_table, fd_set *read_set, 
     if (message->len == 0) {
         free(message->data);
         free(message);
-        close_connection(fd, translation_table, read_set, max_sd);
+        close_connection(fd, proxy);
         return SUCCESS;
     }
     // here we got a message from a client
     // we should check whether he established connection or not
-    fprintf(stderr, "3\n");
-    if (status_table[fd] == NEW_CLIENT) {
-        int return_value = handle_greeting(fd, message);
+    if (proxy->status_table[fd] == NEW_CLIENT) {
+        int return_value = handle_greeting(fd, proxy, message);
         free(message->data);
         free(message);
         if (return_value == SUCCESS) {
-            printf("[PROXY] Greeting passed successfully\n");
-            status_table[fd] = PASSED_GREETING;
+            if (proxy->print_allowed) printf("[PROXY] Greeting passed successfully\n");
+            proxy->status_table[fd] = PASSED_GREETING;
         } else {
-            printf("[PROXY] Greeting not passed\n");
-            close_connection(fd, translation_table, read_set, max_sd);
-            status_table[fd] = REJECTED;
+            if (proxy->print_allowed) printf("[PROXY] Greeting not passed\n");
+            close_connection(fd, proxy);
+            proxy->status_table[fd] = REJECTED;
         }
         return return_value;
-    } else if (status_table[fd] == PASSED_GREETING) {
-        int return_value = handle_conn_request(fd, translation_table, read_set, max_sd, message);
+    } else if (proxy->status_table[fd] == PASSED_GREETING) {
+        int return_value = handle_conn_request(fd, proxy, message);
         free(message->data);
         free(message);
         if (return_value == SUCCESS) {
-            status_table[fd] = PASSED_SEND_REQUEST;
+            proxy->status_table[fd] = PASSED_SEND_REQUEST;
         } else {
-            close_connection(fd, translation_table, read_set, max_sd);
-            status_table[fd] = REJECTED;
+            close_connection(fd, proxy);
+            proxy->status_table[fd] = REJECTED;
         }
         return return_value;
+    } else if (proxy->status_table[fd] == REJECTED) {
+        free(message->data);
+        free(message);
+        close_connection(fd, proxy);
+        return FAIL;
     }
-    fprintf(stderr, "4\n");
-    if (print_allowed) printf("[PROXY] Received from %d:\n%s\n\nLength: %zu\n", fd, message->data, message->len);
-    bool sent = write_into_file(translation_table[fd], message);
-    fprintf(stderr, "5\n");
-    if (!sent) {
-        perror("[PROXY] Error in write");
+    if (proxy->print_allowed) printf("[PROXY] Received from %d:\n%s\n\nLength: %zu\n", fd, message->data, message->len);
+    if (proxy->print_allowed) printf("[PROXY] Pushed message to a queue for %d\n", proxy->translation_table[fd]);
+    proxy->status_table[proxy->translation_table[fd]] = SERVER;
+    put_message_into_queue(proxy->translation_table[fd], proxy, message);
+    return SUCCESS;
+}
+
+static int max(int a, int b) {
+    if (a >= b) {
+        return a;
     }
+    return b;
+}
+
+static int send_message(int fd, proxy_t *proxy, message_t *message) {
+    bool written = write_all(fd, message);
+    size_t len = message->len;
     free(message->data);
     free(message);
+    proxy->message_queue[fd] = NULL;
+    proxy->has_message_to_send[fd] = false;
+    if (!written) {
+        perror("[PROXY] Error in write_all()");
+        return FAIL;
+    } else {
+        if (proxy->print_allowed) printf("[PROXY] sent %zu bytes\n", len);
+    }
     return SUCCESS;
 }
 
 int main(int argc, char *argv[]) {
-    memset(status_table, NEW_CLIENT, MAX_CLIENTS_COUNT * 2 + 3);
     args_t args = parse_args(argc, argv);
     if (!args.valid) {
         fprintf(stderr, "%s\n", USAGE_GUIDE);
         return EXIT_FAILURE;
     }
+    proxy_t proxy;
+    memset(proxy.translation_table, 0x00, MAX_CLIENTS_COUNT * 2 + 3);
+    memset(proxy.message_queue, 0x00, (MAX_CLIENTS_COUNT * 2 + 3));
+    memset(proxy.has_message_to_send, false, (MAX_CLIENTS_COUNT * 2 + 3));
+    memset(proxy.status_table, NEW_CLIENT, MAX_CLIENTS_COUNT * 2 + 3);
     if (args.print_allowed) {
-        print_allowed = true;
+        proxy.print_allowed = true;
     }
     int return_value = init_signal_handlers();
     if (return_value == FAIL) {
         fprintf(stderr, "[PROXY] Error in init_signal_handlers()\n");
         return EXIT_FAILURE;
     }
-    /* This table matches client socket of a proxy server
-     * and client socket of a main server */
-    int *translation_table = (int *) calloc(MAX_CLIENTS_COUNT * 2 + 3, sizeof(*translation_table));
-    if (translation_table == NULL) {
-        fprintf(stderr, "[PROXY] Error in malloc()\n");
-        return EXIT_FAILURE;
-    }
     int proxy_socket = init_and_bind_proxy_socket(args);
     if (proxy_socket == FAIL) {
         fprintf(stderr, "[PROXY] Error in init_and_bind_proxy_socket()\n");
-        free(translation_table);
         return EXIT_FAILURE;
     }
     return_value = listen(proxy_socket, MAX_CLIENTS_COUNT);
@@ -371,49 +472,65 @@ int main(int argc, char *argv[]) {
         if (return_value == FAIL) {
             perror("[PROXY] Error in close");
         }
-        free(translation_table);
         return EXIT_FAILURE;
     }
-    fd_set master_read_set;
-    FD_ZERO(&master_read_set);
-    int max_sd = proxy_socket;
-    FD_SET(signal_pipe[READ_PIPE_END], &master_read_set);
-    FD_SET(proxy_socket, &master_read_set); // add listen_fd to our set
+    FD_ZERO(&proxy.write_wait_set);
+    FD_ZERO(&proxy.read_wait_set);
+    fd_set constant_read_set;
+    fd_set constant_write_set;
+    proxy.max_fd = proxy_socket;
+    FD_SET(signal_pipe[READ_PIPE_END], &proxy.read_wait_set);
+    FD_SET(proxy_socket, &proxy.read_wait_set); // add listen_fd to our set
     struct timeval timeout = {
             .tv_sec = WAIT_TIME,
             .tv_usec = 0
     };
-    fd_set working_read_set;
     bool shutdown = false;
-    if (print_allowed) printf("[PROXY] Running...\n");
+    if (proxy.print_allowed) printf("[PROXY] Running...\n");
     while (shutdown == false) {
-        if (print_allowed) printf("[PROXY] Waiting on select...\n");
-        memcpy(&working_read_set, &master_read_set, sizeof(master_read_set));
-        return_value = select(max_sd + 1, &working_read_set, NULL, NULL, &timeout);
-        if (return_value == FAIL) {
-            if (errno != EINTR) {
-                perror("[PROXY] Error in select");
-            }
-            break;
-        }
-        if (return_value == TIMEOUT_CODE) {
-            fprintf(stderr, "[PROXY] Select timed out. End program.\n");
+        if (proxy.print_allowed) printf("[PROXY] Waiting on select, max_fd = %d\n", proxy.max_fd);
+        memcpy(&constant_read_set, &proxy.read_wait_set, sizeof(proxy.read_wait_set));
+        memcpy(&constant_write_set, &proxy.write_wait_set, sizeof(proxy.write_wait_set));
+        return_value = select(proxy.max_fd + 1, &constant_read_set, &constant_write_set, NULL, &timeout);
+        if (return_value == FAIL || return_value == TIMEOUT_CODE) {
+            if (errno != EINTR) perror("[PROXY] Error in select");
+            if (return_value == TIMEOUT_CODE) fprintf(stderr, "[PROXY] Select timed out. End program.\n");
             break;
         }
         int desc_ready = return_value;
-        for (int fd = 0; fd <= max_sd && desc_ready > 0; ++fd) {
-            if (FD_ISSET(fd, &working_read_set)) {
+        for (int fd = 0; fd <= proxy.max_fd && desc_ready > 0; ++fd) {
+            if (FD_ISSET(fd, &constant_write_set)) {
+                desc_ready -= 1;
+                if (proxy.print_allowed) printf("[PROXY] Ready to send message to %d\n", fd);
+                if (proxy.status_table[fd] == WAIT_FOR_CONNECT) {
+                    return_value = connect_to_remote(fd, &proxy);
+                    if (return_value == FAIL) {
+                        fprintf(stderr, "[PROXY] failed to connect\n");
+                    } else {
+                        if (proxy.print_allowed) printf("[PROXY] Connected\n");
+                    }
+                } else {
+                    FD_CLR(fd, &proxy.write_wait_set);
+                    message_t *message = proxy.message_queue[fd];
+                    if (message == NULL) {
+                        fprintf(stderr, "[PROXY] NULL message to send\n");
+                    } else {
+                        send_message(fd, &proxy, message);
+                    }
+                }
+            }
+            if (FD_ISSET(fd, &constant_read_set)) {
                 desc_ready -= 1;
                 if (fd == proxy_socket) {
-                    fprintf(stderr, "[PROXY] handle new connection... %d\n", fd);
-                    return_value = handle_new_connection(proxy_socket, &master_read_set, &max_sd);
+                    if (proxy.print_allowed) fprintf(stderr, "[PROXY] handle new connection... %d\n", fd);
+                    return_value = handle_new_connection(proxy_socket, &proxy);
                     if (return_value == FAIL) {
                         shutdown = true;
                         break;
                     }
                 } else {
-                    fprintf(stderr, "[PROXY] handle new message...\n");
-                    return_value = handle_new_message(fd, translation_table, &master_read_set, &max_sd);
+                    if (proxy.print_allowed) fprintf(stderr, "[PROXY] handle new message...\n");
+                    return_value = handle_new_message(fd, &proxy);
                     if (return_value == TERMINATE) {
                         goto FINISH;
                     }
@@ -423,11 +540,18 @@ int main(int argc, char *argv[]) {
     }
     FINISH:
     {
-        free(translation_table);
-        if (print_allowed) printf("\n[PROXY] Shutdown...\n");
-        for (int sock_fd = 0; sock_fd <= max_sd; ++sock_fd) {
-            if (FD_ISSET(sock_fd, &master_read_set)) {
-                return_value = close(sock_fd);
+        for (int i = 0; i < MAX_CLIENTS_COUNT * 2 + 3; i++) {
+            if (proxy.has_message_to_send[i]) {
+                message_t *message = proxy.message_queue[i];
+                if (message == 0x00) continue;
+                free(message->data);
+                free(message);
+            }
+        }
+        if (proxy.print_allowed) printf("\n[PROXY] Shutdown...\n");
+        for (int fd = 0; fd <= proxy.max_fd; ++fd) {
+            if (FD_ISSET(fd, &proxy.read_wait_set) || FD_ISSET(fd, &proxy.write_wait_set)) {
+                return_value = close(fd);
                 if (return_value == FAIL) {
                     perror("=== Error in close");
                 }

@@ -4,14 +4,14 @@
 #include <stdbool.h>
 #include <stdio.h>
 
-#define MSG_LENGTH_LIMIT (16 * 1024)
+#define MSG_LENGTH_LIMIT (32 * 1024)
 
 typedef struct message_t {
     char *data;
     size_t len;
 } message_t;
 
-bool write_into_file(int fd, message_t *message);
+bool write_all(int fd, message_t *message);
 
 bool fwrite_into_pipe(FILE *pipe_fd, char *buffer, size_t len);
 
@@ -19,7 +19,7 @@ bool fwrite_into_pipe(FILE *pipe_fd, char *buffer, size_t len);
  * reads as many bytes from file as possible,
  * but not more that MSG_LENGTH_LIMIT
  */
-message_t *read_from_socket(int socket_fd);
+message_t *read_all(int socket_fd);
 
 char *read_from_file(int pipe_fd);
 
